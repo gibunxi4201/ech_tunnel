@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -290,7 +291,7 @@ func parseHTTPSRecord(data []byte) string {
 	return ""
 }
 
-// ======================== WebSocket 服务端 ========================
+// ======================== WebSocket 服务端（修复版） ========================
 
 func generateSelfSignedCert() (tls.Certificate, error) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -434,7 +435,12 @@ func runWebSocketServer(addr string) {
 	}
 }
 
+// ======================== 修复后的 handleWebSocket ========================
 func handleWebSocket(wsConn *websocket.Conn) {
+	// 创建一个 context 用于通知所有 goroutine 退出
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // 函数退出时取消所有子 goroutine
+
 	var mu sync.Mutex
 	var connMu sync.RWMutex
 	conns := make(map[string]net.Conn)
@@ -444,18 +450,31 @@ func handleWebSocket(wsConn *websocket.Conn) {
 	udpTargets := make(map[string]*net.UDPAddr)
 
 	defer func() {
-		connMu.RLock()
-		for _, c := range conns {
+		// 先取消所有 goroutine
+		cancel()
+
+		// 关闭所有 TCP 连接（这会让阻塞的 Read 立即返回错误）
+		connMu.Lock()
+		for id, c := range conns {
 			_ = c.Close()
+			log.Printf("[服务端] 清理TCP连接: %s", id)
 		}
-		connMu.RUnlock()
-		connMu.RLock()
-		for _, uc := range udpConns {
+		conns = make(map[string]net.Conn)
+		connMu.Unlock()
+
+		// 关闭所有 UDP 连接
+		connMu.Lock()
+		for id, uc := range udpConns {
 			_ = uc.Close()
+			log.Printf("[服务端] 清理UDP连接: %s", id)
 		}
-		connMu.RUnlock()
+		udpConns = make(map[string]*net.UDPConn)
+		udpTargets = make(map[string]*net.UDPAddr)
+		connMu.Unlock()
+
+		// 最后关闭 WebSocket
 		_ = wsConn.Close()
-		log.Printf("WebSocket 连接 %s 已关闭", wsConn.RemoteAddr())
+		log.Printf("WebSocket 连接 %s 已完全清理", wsConn.RemoteAddr())
 	}()
 
 	// 设置WebSocket保活
@@ -471,7 +490,7 @@ func handleWebSocket(wsConn *websocket.Conn) {
 			if !isNormalCloseError(readErr) {
 				log.Printf("WebSocket 读取失败 %s: %v", wsConn.RemoteAddr(), readErr)
 			}
-			return
+			return // defer 会触发清理
 		}
 
 		if typ == websocket.BinaryMessage {
@@ -513,7 +532,6 @@ func handleWebSocket(wsConn *websocket.Conn) {
 					if ok {
 						if _, err := c.Write([]byte(payload)); err != nil && !isNormalCloseError(err) {
 							log.Printf("[服务端] 写入目标失败: %v", err)
-							return
 						}
 					}
 				}
@@ -556,12 +574,32 @@ func handleWebSocket(wsConn *websocket.Conn) {
 				udpTargets[connID] = udpAddr
 				connMu.Unlock()
 
-				// 启动 UDP 接收 goroutine
-				go func(cID string, uc *net.UDPConn) {
+				// 启动 UDP 接收 goroutine（监听 context 取消）
+				go func(cID string, uc *net.UDPConn, ctx context.Context) {
+					defer func() {
+						connMu.Lock()
+						delete(udpConns, cID)
+						delete(udpTargets, cID)
+						connMu.Unlock()
+						_ = uc.Close()
+					}()
+
 					buffer := make([]byte, 65535)
 					for {
+						select {
+						case <-ctx.Done():
+							log.Printf("[服务端UDP:%s] 上下文取消，退出接收循环", cID)
+							return
+						default:
+						}
+
+						// 设置短超时，避免永久阻塞
+						_ = uc.SetReadDeadline(time.Now().Add(1 * time.Second))
 						n, addr, err := uc.ReadFromUDP(buffer)
 						if err != nil {
+							if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+								continue // 超时继续循环，检查 ctx
+							}
 							if !isNormalCloseError(err) {
 								log.Printf("[服务端UDP:%s] 读取失败: %v", cID, err)
 							}
@@ -579,7 +617,7 @@ func handleWebSocket(wsConn *websocket.Conn) {
 						_ = wsConn.WriteMessage(websocket.BinaryMessage, response)
 						mu.Unlock()
 					}
-				}(connID, udpConn)
+				}(connID, udpConn, ctx)
 
 				log.Printf("[服务端UDP:%s] UDP目标已设置: %s", connID, targetAddr)
 
@@ -594,12 +632,14 @@ func handleWebSocket(wsConn *websocket.Conn) {
 		// UDP_CLOSE: 关闭 UDP 连接
 		if strings.HasPrefix(data, "UDP_CLOSE:") {
 			connID := strings.TrimPrefix(data, "UDP_CLOSE:")
+			connMu.Lock()
 			if uc, ok := udpConns[connID]; ok {
 				_ = uc.Close()
 				delete(udpConns, connID)
 				delete(udpTargets, connID)
 				log.Printf("[服务端UDP:%s] 连接已关闭", connID)
 			}
+			connMu.Unlock()
 			continue
 		}
 
@@ -629,62 +669,8 @@ func handleWebSocket(wsConn *websocket.Conn) {
 
 				log.Printf("[服务端] 请求TCP转发，连接ID: %s，目标: %s，首帧长度: %d", connID, targetAddr, len(firstFrameData))
 
-				go func(id, target, firstFrame string) {
-					tcpConn, err := net.Dial("tcp", target)
-					if err != nil {
-						log.Printf("[服务端] 连接目标地址 %s 失败: %v", target, err)
-						mu.Lock()
-						_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+id))
-						mu.Unlock()
-						return
-					}
-
-					// 保存连接
-					connMu.Lock()
-					conns[id] = tcpConn
-					connMu.Unlock()
-
-					// 发送第一帧
-					if firstFrame != "" {
-						if _, err := tcpConn.Write([]byte(firstFrame)); err != nil {
-							log.Printf("[服务端] 发送第一帧失败: %v", err)
-							_ = tcpConn.Close()
-							connMu.Lock()
-							delete(conns, id)
-							connMu.Unlock()
-							return
-						}
-					}
-
-					// 通知客户端连接成功
-					mu.Lock()
-					_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CONNECTED:"+id))
-					mu.Unlock()
-
-					// 从目标读取数据并转发
-					go func() {
-						buf := make([]byte, 4096)
-						for {
-							n, err := tcpConn.Read(buf)
-							if err != nil {
-								if !isNormalCloseError(err) {
-									log.Printf("[服务端] 从目标读取失败: %v", err)
-								}
-								mu.Lock()
-								_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+id))
-								mu.Unlock()
-								_ = tcpConn.Close()
-								connMu.Lock()
-								delete(conns, id)
-								connMu.Unlock()
-								return
-							}
-							mu.Lock()
-							_ = wsConn.WriteMessage(websocket.BinaryMessage, append([]byte("DATA:"+id+"|"), buf[:n]...))
-							mu.Unlock()
-						}
-					}()
-				}(connID, targetAddr, firstFrameData)
+				// 启动连接处理 goroutine（传入 ctx）
+				go handleTCPConnection(ctx, connID, targetAddr, firstFrameData, wsConn, &mu, &connMu, conns)
 			}
 			continue
 		} else if strings.HasPrefix(data, "DATA:") {
@@ -698,26 +684,119 @@ func handleWebSocket(wsConn *websocket.Conn) {
 				if ok {
 					if _, err := c.Write([]byte(payload)); err != nil && !isNormalCloseError(err) {
 						log.Printf("[服务端] 写入目标失败: %v", err)
-						return
 					}
 				}
 			}
 			continue
 		} else if strings.HasPrefix(data, "CLOSE:") {
 			id := strings.TrimPrefix(data, "CLOSE:")
-			connMu.RLock()
+			connMu.Lock()
 			c, ok := conns[id]
-			connMu.RUnlock()
 			if ok {
 				_ = c.Close()
-				connMu.Lock()
 				delete(conns, id)
-				connMu.Unlock()
 				log.Printf("[服务端] 客户端请求关闭连接: %s", id)
 			}
+			connMu.Unlock()
 			continue
 		}
 	}
+}
+
+// ======================== 独立的 TCP 连接处理函数（监听 context） ========================
+func handleTCPConnection(
+	ctx context.Context,
+	connID, targetAddr, firstFrameData string,
+	wsConn *websocket.Conn,
+	mu *sync.Mutex,
+	connMu *sync.RWMutex,
+	conns map[string]net.Conn,
+) {
+	tcpConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		log.Printf("[服务端] 连接目标地址 %s 失败: %v", targetAddr, err)
+		mu.Lock()
+		_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+connID))
+		mu.Unlock()
+		return
+	}
+
+	// 保存连接
+	connMu.Lock()
+	conns[connID] = tcpConn
+	connMu.Unlock()
+
+	// 确保退出时清理
+	defer func() {
+		_ = tcpConn.Close()
+		connMu.Lock()
+		delete(conns, connID)
+		connMu.Unlock()
+		log.Printf("[服务端] TCP连接已清理: %s", connID)
+	}()
+
+	// 发送第一帧
+	if firstFrameData != "" {
+		if _, err := tcpConn.Write([]byte(firstFrameData)); err != nil {
+			log.Printf("[服务端] 发送第一帧失败: %v", err)
+			mu.Lock()
+			_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+connID))
+			mu.Unlock()
+			return
+		}
+	}
+
+	// 通知客户端连接成功
+	mu.Lock()
+	_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CONNECTED:"+connID))
+	mu.Unlock()
+
+	// 启动读取 goroutine（监听 ctx.Done()）
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 32768)
+		for {
+			select {
+			case <-ctx.Done():
+				// WebSocket 已关闭，强制关闭 TCP 连接
+				log.Printf("[服务端] WebSocket 已关闭，强制关闭 TCP 连接: %s", connID)
+				_ = tcpConn.Close()
+				return
+			default:
+			}
+
+			// 设置短超时，避免永久阻塞
+			_ = tcpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			n, err := tcpConn.Read(buf)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue // 超时继续循环，检查 ctx
+				}
+				if !isNormalCloseError(err) {
+					log.Printf("[服务端] 从目标读取失败: %v", err)
+				}
+				mu.Lock()
+				_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+connID))
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			writeErr := wsConn.WriteMessage(websocket.BinaryMessage, append([]byte("DATA:"+connID+"|"), buf[:n]...))
+			mu.Unlock()
+
+			if writeErr != nil {
+				if !isNormalCloseError(writeErr) {
+					log.Printf("[服务端] 写入 WebSocket 失败: %v", writeErr)
+				}
+				return
+			}
+		}
+	}()
+
+	// 等待读取 goroutine 结束
+	<-done
 }
 
 // ======================== TCP 正向转发客户端（采用 ECH） ========================
