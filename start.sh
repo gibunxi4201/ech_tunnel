@@ -30,8 +30,8 @@ chmod +x ech-tunnel
 ls
 
 # ======== 请在这里修改你的配置 ========
-#CLOUDFLARE_URL="ech-img.playingapi.tech" # 你的 cloudflared 域名
-CLOUDFLARE_TOKEN="eyJhIjoiODllMDYzZWYxOGQ3ZmVjZjhlY2E2NTBiYWFjNzZjYmYiLCJ0IjoiZDg4ZjU5OTctZGE3Mi00MzNmLWE5NGUtNGY5MjcyOWU3NTYwIiwicyI6Ik1UZ3dZalU0T1RVdE5qVTJOQzAwTmpJeExXSTJaak10TVRnNU5UazRaVEZqTVRJMCJ9"
+#CLOUDFLARE_URL="ech-img2.playingapi.tech" # 你的 cloudflared 域名
+CLOUDFLARE_TOKEN="eyJhIjoiODllMDYzZWYxOGQ3ZmVjZjhlY2E2NTBiYWFjNzZjYmYiLCJ0IjoiZDg5ZjYwZGYtYzdiNy00MTVmLThhZTYtNzE2ZTg4NmM4YTczIiwicyI6IllqQTRZMkV4WkRndFltRTJaQzAwTVdFMkxXSTFaVEF0WW1WaE16TmxZVEZrWlRFNSJ9"
 ECH_TUNNEL_TOKEN="7bd57098-82bd-4dfa-b32c-9943a52d354f" # ech-tunnel 共享 token
 #LOCAL_ADDR="127.0.0.1:8888"                             # ech-tunnel 监听地址
 
